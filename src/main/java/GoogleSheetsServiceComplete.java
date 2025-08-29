@@ -9,6 +9,8 @@ import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.time.Instant;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Service class để tương tác với Google Sheets API sử dụng Service Account
@@ -33,11 +35,203 @@ public class GoogleSheetsServiceComplete {
     public static final int FAILED_FILES_COL = 6;
     public static final int RESTRICTED_FILES_COL = 7;
     public static final int DETAIL_LINK_COL = 8;
+    private final Map<String, Queue<FileProcessingResult>> updateQueues = new ConcurrentHashMap<>();
+    private final Map<String, String> sheetNameCache = new ConcurrentHashMap<>();
+    private final Object batchLock = new Object();
+    private long lastApiCall = 0;
+    private final long API_CALL_INTERVAL = 100; // 100ms between calls
+
 
     public GoogleSheetsServiceComplete(String serviceAccountEmail, String privateKey, String spreadsheetId) {
         this.serviceAccountEmail = serviceAccountEmail;
         this.privateKey = privateKey;
         this.spreadsheetId = spreadsheetId;
+    }
+
+    private void waitForRateLimit() {
+        long now = System.currentTimeMillis();
+        long timeSinceLastCall = now - lastApiCall;
+        if (timeSinceLastCall < API_CALL_INTERVAL) {
+            try {
+                Thread.sleep(API_CALL_INTERVAL - timeSinceLastCall);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+        lastApiCall = System.currentTimeMillis();
+    }
+
+    /**
+     * Tạo detail sheet ngay khi bắt đầu xử lý user
+     */
+    public void createUserDetailSheetEarly(String userEmail) throws Exception {
+        String sheetName = "Detail_" + userEmail.replace("@", "_at_").replace(".", "_");
+        sheetNameCache.put(userEmail, sheetName);
+
+        System.out.println("DEBUG: Creating detail sheet for user: " + userEmail);
+
+        try {
+            // Tạo sheet mới
+            String createEndpoint = String.format(
+                    "https://sheets.googleapis.com/v4/spreadsheets/%s:batchUpdate",
+                    spreadsheetId
+            );
+
+            String createPayload = String.format(
+                    "{\"requests\":[{\"addSheet\":{\"properties\":{\"title\":\"%s\"}}}]}",
+                    sheetName
+            );
+
+            try {
+                makeApiRequest(createEndpoint, "POST", createPayload);
+                System.out.println("DEBUG: Successfully created sheet: " + sheetName);
+            } catch (Exception e) {
+                if (!e.getMessage().contains("already exists")) {
+                    throw e;
+                }
+                System.out.println("DEBUG: Sheet already exists: " + sheetName);
+            }
+
+            // Thêm headers ngay lập tức
+            List<String> headers = Arrays.asList(
+                    "Timestamp", "File Name", "File ID", "Type", "Permission Type",
+                    "Status", "Old Email", "New Email", "Role", "Error Message"
+            );
+
+            String headerEndpoint = String.format(
+                    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A1:J1?valueInputOption=RAW",
+                    spreadsheetId, sheetName
+            );
+
+            String headerPayload = "{\"values\":[" +
+                    "[\"" + String.join("\",\"", headers) + "\"]" +
+                    "]}";
+
+            makeApiRequest(headerEndpoint, "PUT", headerPayload);
+
+            // Khởi tạo queue cho user này
+            updateQueues.put(userEmail, new LinkedList<>());
+
+            System.out.println("DEBUG: Detail sheet ready for user: " + userEmail);
+
+        } catch (Exception e) {
+            System.err.println("ERROR: Failed to create detail sheet for " + userEmail + ": " + e.getMessage());
+            throw e;
+        }
+    }
+
+    /**
+     * Thêm file result vào detail sheet (realtime)
+     */
+    public void appendFileResultToDetailSheet(String userEmail, FileProcessingResult result) throws Exception {
+        synchronized (batchLock) {
+            Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
+            if (queue != null) {
+                queue.offer(result);
+                System.out.println("DEBUG: Queued file result for " + userEmail + ": " + result.fileName);
+
+                // Nếu queue đủ lớn, flush ngay
+                if (queue.size() >= 10) {
+                    flushUserUpdates(userEmail);
+                }
+            }
+        }
+    }
+
+    /**
+     * Flush tất cả pending updates cho một user
+     */
+    private void flushUserUpdates(String userEmail) throws Exception {
+        Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
+        if (queue == null || queue.isEmpty()) {
+            return;
+        }
+
+        List<FileProcessingResult> batch = new ArrayList<>();
+        while (!queue.isEmpty() && batch.size() < 20) {
+            batch.add(queue.poll());
+        }
+
+        if (batch.isEmpty()) {
+            return;
+        }
+
+        System.out.println("DEBUG: Flushing " + batch.size() + " file results for " + userEmail);
+
+        String sheetName = sheetNameCache.get(userEmail);
+        if (sheetName == null) {
+            System.err.println("ERROR: No sheet name found for user: " + userEmail);
+            return;
+        }
+
+        try {
+            // Tìm next empty row
+            String checkEndpoint = String.format(
+                    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A:A",
+                    spreadsheetId, sheetName
+            );
+
+            String response = makeApiRequest(checkEndpoint, "GET", null);
+            List<List<String>> values = parseValuesFromResponse(response);
+            int nextRow = (values != null ? values.size() : 0) + 1;
+
+            // Prepare batch data
+            List<List<String>> data = new ArrayList<>();
+            for (FileProcessingResult result : batch) {
+                List<String> row = Arrays.asList(
+                        new Date().toString(),
+                        result.fileName != null ? result.fileName : "",
+                        result.fileId != null ? result.fileId : "",
+                        result.fileType != null ? result.fileType : "",
+                        result.permissionType != null ? result.permissionType : "",
+                        result.status != null ? result.status : "",
+                        result.oldEmail != null ? result.oldEmail : "",
+                        result.newEmail != null ? result.newEmail : "",
+                        result.role != null ? result.role : "",
+                        result.errorMessage != null ? result.errorMessage : ""
+                );
+                data.add(row);
+            }
+
+            // Batch update
+            String updateEndpoint = String.format(
+                    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A%d:J%d?valueInputOption=RAW",
+                    spreadsheetId, sheetName, nextRow, nextRow + data.size() - 1
+            );
+
+            StringBuilder dataJson = new StringBuilder();
+            dataJson.append("{\"values\":[");
+            for (int i = 0; i < data.size(); i++) {
+                if (i > 0) dataJson.append(",");
+                dataJson.append("[\"").append(String.join("\",\"", data.get(i))).append("\"]");
+            }
+            dataJson.append("]}");
+
+            makeApiRequest(updateEndpoint, "PUT", dataJson.toString());
+            System.out.println("DEBUG: Successfully flushed " + batch.size() + " results to " + sheetName);
+
+        } catch (Exception e) {
+            System.err.println("ERROR: Failed to flush updates for " + userEmail + ": " + e.getMessage());
+            // Re-queue the batch for retry
+            for (FileProcessingResult result : batch) {
+                queue.offer(result);
+            }
+        }
+    }
+
+    /**
+     * Cleanup resources và flush remaining updates
+     */
+    public void flushAllPendingUpdates() {
+        synchronized (batchLock) {
+            for (String userEmail : updateQueues.keySet()) {
+                try {
+                    flushUserUpdates(userEmail);
+                } catch (Exception e) {
+                    System.err.println("ERROR: Failed to flush final updates for " + userEmail);
+                }
+            }
+        }
     }
 
     /**
@@ -141,6 +335,7 @@ public class GoogleSheetsServiceComplete {
      * Thực hiện HTTP request đến Google Sheets API
      */
     private String makeApiRequest(String endpoint, String method, String payload) throws Exception {
+        waitForRateLimit();
         String accessToken = getAccessToken(serviceAccountEmail);
 
         URL url = new URL(endpoint);

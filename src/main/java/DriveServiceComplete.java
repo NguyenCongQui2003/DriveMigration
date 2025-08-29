@@ -366,7 +366,7 @@ public class DriveServiceComplete {
                     try {
                         // Create new permission
                         String permissionPayload = String.format(
-                                "{\"type\":\"user\",\"role\":\"%s\",\"emailAddress\":\"%s\",\"sendNotificationEmails\":false}",
+                                "{\"type\":\"user\",\"role\":\"%s\",\"emailAddress\":\"%s\",\"sendNotificationEmails\":false,\"suppressNotifications\":true,\"sendNotificationEmail\":false}",
                                 permission.role, newEmail
                         );
 

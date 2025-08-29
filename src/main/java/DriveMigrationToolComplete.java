@@ -538,6 +538,9 @@ public class DriveMigrationToolComplete extends JFrame {
                 executor.shutdown();
                 try {
                     if (executor.awaitTermination(24, TimeUnit.HOURS)) {
+                        // THÊM DÒNG NÀY:
+                        sheetsService.flushAllPendingUpdates();
+
                         SwingUtilities.invokeLater(() -> {
                             startButton.setEnabled(true);
                             pauseButton.setEnabled(false);
@@ -578,12 +581,31 @@ public class DriveMigrationToolComplete extends JFrame {
             // Update status in Google Sheets
             sheetsService.updateUserStatus(user.email, user.rowIndex, "In Progress", null);
 
+// TẠO DETAIL SHEET NGAY ĐÂY
+            try {
+                sheetsService.createUserDetailSheetEarly(user.email);
+                appendLog("📝 Đã tạo detail sheet cho: " + user.email);
+            } catch (Exception e) {
+                appendLog("⚠ Lỗi tạo detail sheet cho " + user.email + ": " + e.getMessage());
+                // Không throw exception, tiếp tục migration
+            }
+
             // Process user's drive
             MigrationResult result = driveService.processUserDrive(user.email, userMapping,
                     (email, current, total, fileResult) -> {
                         SwingUtilities.invokeLater(() -> {
                             updateUserProgress(email, current, total);
                             updateFileStatistics(fileResult);
+
+                            // THÊM REALTIME UPDATE VÀO GOOGLE SHEETS
+                            try {
+                                sheetsService.appendFileResultToDetailSheet(email, fileResult);
+                            } catch (Exception e) {
+                                // Không log quá nhiều để tránh spam
+                                if (current % 50 == 1) { // Chỉ log mỗi 50 files
+                                    appendLog("⚠ Lỗi ghi detail sheet cho " + email + ": " + e.getMessage());
+                                }
+                            }
                         });
                     });
 
@@ -607,7 +629,7 @@ public class DriveMigrationToolComplete extends JFrame {
 
             sheetsService.updateUserStatus(user.email, user.rowIndex,
                     result.success ? "Completed" : "Failed", stats);
-            sheetsService.createOrUpdateUserDetailSheet(user.email, result.fileResults);
+           // sheetsService.createOrUpdateUserDetailSheet(user.email, result.fileResults);
 
         } catch (Exception e) {
             SwingUtilities.invokeLater(() -> {
