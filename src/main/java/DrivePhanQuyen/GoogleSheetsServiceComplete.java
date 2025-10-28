@@ -40,9 +40,17 @@ public class GoogleSheetsServiceComplete {
     public static final int DETAIL_LINK_COL = 8;
     private final Map<String, Queue<FileProcessingResult>> updateQueues = new ConcurrentHashMap<>();
     private final Map<String, String> sheetNameCache = new ConcurrentHashMap<>();
+    private final Map<String, Integer> sheetIdCache = new ConcurrentHashMap<>();
     private final Object batchLock = new Object();
+
+    // RATE LIMITING - QUAN TRỌNG
     private long lastApiCall = 0;
-    private final long API_CALL_INTERVAL = 100; // 100ms between calls
+    private final long API_CALL_INTERVAL = 1200; // 1.2 giây giữa các calls
+    private final int MAX_RETRIES = 5;
+
+    // BATCH SETTINGS - TĂNG BATCH SIZE
+    private static final int FLUSH_BATCH_SIZE = 100; // Tăng từ 20 lên 100
+    private static final int AUTO_FLUSH_THRESHOLD = 200; // Tăng từ 10 lên 200
 
 
     public GoogleSheetsServiceComplete(String serviceAccountEmail, String privateKey, String spreadsheetId) {
@@ -51,12 +59,17 @@ public class GoogleSheetsServiceComplete {
         this.spreadsheetId = spreadsheetId;
     }
 
+    /**
+     * IMPROVED: Rate limiting với exponential backoff
+     */
     private void waitForRateLimit() {
         long now = System.currentTimeMillis();
         long timeSinceLastCall = now - lastApiCall;
         if (timeSinceLastCall < API_CALL_INTERVAL) {
             try {
-                Thread.sleep(API_CALL_INTERVAL - timeSinceLastCall);
+                long sleepTime = API_CALL_INTERVAL - timeSinceLastCall;
+                System.out.println("DEBUG: Rate limiting - sleeping " + sleepTime + "ms");
+                Thread.sleep(sleepTime);
             } catch (InterruptedException e) {
                 Thread.currentThread().interrupt();
             }
@@ -65,10 +78,50 @@ public class GoogleSheetsServiceComplete {
     }
 
     /**
+     * IMPROVED: Retry logic với exponential backoff
+     */
+    private String makeApiRequestWithRetry(String endpoint, String method, String payload) throws Exception {
+        int retries = 0;
+        Exception lastException = null;
+
+        while (retries < MAX_RETRIES) {
+            try {
+                waitForRateLimit();
+                return makeApiRequest(endpoint, method, payload);
+            } catch (Exception e) {
+                lastException = e;
+                String errorMsg = e.getMessage();
+
+                // Check if it's a rate limit error
+                if (errorMsg != null && (errorMsg.contains("429") || errorMsg.contains("RATE_LIMIT_EXCEEDED"))) {
+                    retries++;
+
+                    // Exponential backoff: 2^retries seconds
+                    long backoffTime = (long) Math.pow(2, retries) * 1000;
+                    System.out.println("RATE LIMIT: Retry " + retries + "/" + MAX_RETRIES +
+                            " - waiting " + backoffTime + "ms");
+
+                    try {
+                        Thread.sleep(backoffTime);
+                    } catch (InterruptedException ie) {
+                        Thread.currentThread().interrupt();
+                        throw new Exception("Interrupted during backoff", ie);
+                    }
+                } else {
+                    // Not a rate limit error, throw immediately
+                    throw e;
+                }
+            }
+        }
+
+        throw new Exception("Max retries exceeded for API request", lastException);
+    }
+
+    /**
      * Tạo detail sheet ngay khi bắt đầu xử lý user
      */
     // Thêm map để lưu Sheet ID
-    private final Map<String, Integer> sheetIdCache = new ConcurrentHashMap<>();
+    //private final Map<String, Integer> sheetIdCache = new ConcurrentHashMap<>();
 
     /**
      * Tạo detail sheet ngay khi bắt đầu xử lý user
@@ -80,7 +133,6 @@ public class GoogleSheetsServiceComplete {
         System.out.println("DEBUG: Creating detail sheet for user: " + userEmail);
 
         try {
-            // Tạo sheet mới
             String createEndpoint = String.format(
                     "https://sheets.googleapis.com/v4/spreadsheets/%s:batchUpdate",
                     spreadsheetId
@@ -92,10 +144,9 @@ public class GoogleSheetsServiceComplete {
             );
 
             try {
-                String response = makeApiRequest(createEndpoint, "POST", createPayload);
+                String response = makeApiRequestWithRetry(createEndpoint, "POST", createPayload);
                 System.out.println("DEBUG: Successfully created sheet: " + sheetName);
 
-                // PARSE VÀ LƯU SHEET ID
                 Integer sheetId = extractSheetIdFromResponse(response);
                 if (sheetId != null) {
                     sheetIdCache.put(userEmail, sheetId);
@@ -108,7 +159,6 @@ public class GoogleSheetsServiceComplete {
                 }
                 System.out.println("DEBUG: Sheet already exists: " + sheetName);
 
-                // NẾU SHEET ĐÃ TỒN TẠI, LẤY SHEET ID
                 Integer existingSheetId = getExistingSheetId(sheetName);
                 if (existingSheetId != null) {
                     sheetIdCache.put(userEmail, existingSheetId);
@@ -116,7 +166,7 @@ public class GoogleSheetsServiceComplete {
                 }
             }
 
-            // Thêm headers ngay lập tức
+            // Thêm headers
             List<String> headers = Arrays.asList(
                     "Timestamp", "File Name", "File ID", "Type", "Permission Type",
                     "Status", "Old Email", "New Email", "Role", "Error Message"
@@ -131,9 +181,9 @@ public class GoogleSheetsServiceComplete {
                     "[\"" + String.join("\",\"", headers) + "\"]" +
                     "]}";
 
-            makeApiRequest(headerEndpoint, "PUT", headerPayload);
+            makeApiRequestWithRetry(headerEndpoint, "PUT", headerPayload);
 
-            // Khởi tạo queue cho user này
+            // Khởi tạo queue
             updateQueues.put(userEmail, new LinkedList<>());
 
             System.out.println("DEBUG: Detail sheet ready for user: " + userEmail);
@@ -145,17 +195,17 @@ public class GoogleSheetsServiceComplete {
     }
 
     /**
-     * Thêm file result vào detail sheet (realtime)
+     * IMPROVED: Queue file results với auto-flush ít thường xuyên hơn
      */
     public void appendFileResultToDetailSheet(String userEmail, FileProcessingResult result) throws Exception {
         synchronized (batchLock) {
             Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
             if (queue != null) {
                 queue.offer(result);
-                System.out.println("DEBUG: Queued file result for " + userEmail + ": " + result.fileName);
 
-                // Nếu queue đủ lớn, flush ngay
-                if (queue.size() >= 10) {
+                // THAY ĐỔI: Chỉ flush khi queue đủ LỚN (200 thay vì 10)
+                if (queue.size() >= AUTO_FLUSH_THRESHOLD) {
+                    System.out.println("AUTO-FLUSH: Queue size reached " + AUTO_FLUSH_THRESHOLD);
                     flushUserUpdates(userEmail);
                 }
             }
@@ -168,6 +218,9 @@ public class GoogleSheetsServiceComplete {
     /**
      * Flush tất cả pending updates cho một user - SỬ DỤNG APPEND
      */
+    /**
+     * IMPROVED: Flush với batch lớn hơn (100 files/request)
+     */
     private void flushUserUpdates(String userEmail) throws Exception {
         Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
         if (queue == null || queue.isEmpty()) {
@@ -175,7 +228,9 @@ public class GoogleSheetsServiceComplete {
         }
 
         List<FileProcessingResult> batch = new ArrayList<>();
-        while (!queue.isEmpty() && batch.size() < 20) {
+
+        // THAY ĐỔI: Lấy 100 files mỗi lần thay vì 20
+        while (!queue.isEmpty() && batch.size() < FLUSH_BATCH_SIZE) {
             batch.add(queue.poll());
         }
 
@@ -183,7 +238,7 @@ public class GoogleSheetsServiceComplete {
             return;
         }
 
-        System.out.println("DEBUG: Flushing " + batch.size() + " file results for " + userEmail);
+        System.out.println("FLUSH: Flushing " + batch.size() + " file results for " + userEmail);
 
         String sheetName = sheetNameCache.get(userEmail);
         if (sheetName == null) {
@@ -196,7 +251,7 @@ public class GoogleSheetsServiceComplete {
             List<List<String>> data = new ArrayList<>();
             for (FileProcessingResult result : batch) {
                 List<String> row = Arrays.asList(
-                        getCurrentVietnameseDateTime(), // THAY ĐỔI
+                        getCurrentVietnameseDateTime(),
                         result.fileName != null ? result.fileName : "",
                         result.fileId != null ? result.fileId : "",
                         result.fileType != null ? result.fileType : "",
@@ -210,7 +265,7 @@ public class GoogleSheetsServiceComplete {
                 data.add(row);
             }
 
-            // APPEND - Google tự động mở rộng sheet
+            // APPEND với retry
             String appendEndpoint = String.format(
                     "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A:J:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
                     spreadsheetId, sheetName
@@ -224,14 +279,20 @@ public class GoogleSheetsServiceComplete {
             }
             dataJson.append("]}");
 
-            makeApiRequest(appendEndpoint, "POST", dataJson.toString());
-            System.out.println("DEBUG: Successfully appended " + batch.size() + " results to " + sheetName);
+            makeApiRequestWithRetry(appendEndpoint, "POST", dataJson.toString());
+            System.out.println("FLUSH SUCCESS: Appended " + batch.size() + " results to " + sheetName);
 
         } catch (Exception e) {
-            System.err.println("ERROR: Failed to flush updates for " + userEmail + ": " + e.getMessage());
-            // Re-queue the batch for retry
-            for (FileProcessingResult result : batch) {
-                queue.offer(result);
+            System.err.println("FLUSH ERROR: Failed to flush updates for " + userEmail + ": " + e.getMessage());
+
+            // THAY ĐỔI: Re-queue với giới hạn để tránh memory leak
+            if (queue.size() < 1000) { // Giới hạn 1000 items trong queue
+                for (FileProcessingResult result : batch) {
+                    queue.offer(result);
+                }
+                System.out.println("Re-queued " + batch.size() + " results for retry");
+            } else {
+                System.err.println("WARNING: Queue too large, dropping " + batch.size() + " results");
             }
         }
     }
@@ -259,34 +320,62 @@ public class GoogleSheetsServiceComplete {
         return formatVietnameseDateTime(new Date());
     }
 
+
     /**
-     * Cleanup resources và flush remaining updates
+     * IMPROVED: Flush all với progress tracking
      */
     public void flushAllPendingUpdates() {
         synchronized (batchLock) {
+            System.out.println("=== FINAL FLUSH: Starting ===");
+
+            int totalUsers = updateQueues.size();
+            int processedUsers = 0;
+
             for (String userEmail : updateQueues.keySet()) {
-                try {
-                    flushUserUpdates(userEmail);
-                } catch (Exception e) {
-                    System.err.println("ERROR: Failed to flush final updates for " + userEmail);
+                Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
+                int queueSize = queue != null ? queue.size() : 0;
+
+                if (queueSize > 0) {
+                    System.out.println("FINAL FLUSH: User " + userEmail + " has " + queueSize + " pending updates");
+
+                    try {
+                        // Flush nhiều lần nếu cần
+                        while (queue != null && !queue.isEmpty()) {
+                            flushUserUpdates(userEmail);
+
+                            // Đợi thêm giữa các batch để tránh rate limit
+                            if (!queue.isEmpty()) {
+                                Thread.sleep(2000);
+                            }
+                        }
+                        System.out.println("FINAL FLUSH: Completed for " + userEmail);
+                    } catch (Exception e) {
+                        System.err.println("FINAL FLUSH ERROR: Failed for " + userEmail + ": " + e.getMessage());
+                    }
                 }
+
+                processedUsers++;
+                System.out.println("FINAL FLUSH: Progress " + processedUsers + "/" + totalUsers);
             }
+
+            System.out.println("=== FINAL FLUSH: Completed ===");
         }
     }
 
     /**
      * Tạo JWT token cho Service Account authentication
      */
+    /**
+     * JWT và authentication methods (giữ nguyên)
+     */
     private String createJWT(String userEmail) throws Exception {
         long now = Instant.now().getEpochSecond();
-        long expiry = now + 3600; // 1 hour
+        long expiry = now + 3600;
 
-        // Header
         String header = "{\"alg\":\"RS256\",\"typ\":\"JWT\"}";
         String headerBase64 = Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(header.getBytes());
 
-        // Payload
         String payload = String.format(
                 "{\"iss\":\"%s\",\"scope\":\"%s\",\"aud\":\"https://oauth2.googleapis.com/token\",\"exp\":%d,\"iat\":%d,\"sub\":\"%s\"}",
                 serviceAccountEmail,
@@ -298,7 +387,6 @@ public class GoogleSheetsServiceComplete {
         String payloadBase64 = Base64.getUrlEncoder().withoutPadding()
                 .encodeToString(payload.getBytes());
 
-        // Signature
         String signatureInput = headerBase64 + "." + payloadBase64;
         String signature = signWithPrivateKey(signatureInput, privateKey);
 
@@ -309,7 +397,6 @@ public class GoogleSheetsServiceComplete {
      * Ký JWT với private key
      */
     private String signWithPrivateKey(String data, String privateKeyPem) throws Exception {
-        // Clean private key
         String cleanKey = privateKeyPem
                 .replace("-----BEGIN PRIVATE KEY-----", "")
                 .replace("-----END PRIVATE KEY-----", "")
@@ -358,7 +445,6 @@ public class GoogleSheetsServiceComplete {
                 response.append(line);
             }
 
-            // Parse JSON response to get access_token
             String jsonResponse = response.toString();
             Pattern pattern = Pattern.compile("\"access_token\"\\s*:\\s*\"([^\"]+)\"");
             Matcher matcher = pattern.matcher(jsonResponse);
@@ -375,7 +461,6 @@ public class GoogleSheetsServiceComplete {
      * Thực hiện HTTP request đến Google Sheets API
      */
     private String makeApiRequest(String endpoint, String method, String payload) throws Exception {
-        waitForRateLimit();
         String accessToken = getAccessToken(serviceAccountEmail);
 
         URL url = new URL(endpoint);
