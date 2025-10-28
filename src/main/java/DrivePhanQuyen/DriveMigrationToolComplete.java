@@ -1,3 +1,5 @@
+package DrivePhanQuyen;
+
 import javax.swing.*;
 import javax.swing.table.*;
 import javax.swing.border.*;
@@ -40,7 +42,7 @@ public class DriveMigrationToolComplete extends JFrame {
     private JLabel totalUsersLabel, completedLabel, failedLabel, inProgressLabel;
     private JLabel totalFilesLabel, successFilesLabel, restrictedFilesLabel;
 
-    // Configuration fields
+    // DrivePhanQuyen.Configuration fields
     private JTextField serviceAccountEmailField;
     private JTextField spreadsheetIdField;
 
@@ -71,7 +73,7 @@ public class DriveMigrationToolComplete extends JFrame {
 
     private JPanel createConfigPanel() {
         JPanel panel = new JPanel(new GridBagLayout());
-        panel.setBorder(new TitledBorder("Service Account Configuration"));
+        panel.setBorder(new TitledBorder("Service Account DrivePhanQuyen.Configuration"));
         panel.setBackground(new Color(240, 248, 255));
 
         GridBagConstraints gbc = new GridBagConstraints();
@@ -691,7 +693,7 @@ public class DriveMigrationToolComplete extends JFrame {
 
         if (errors.length() > 0) {
             JOptionPane.showMessageDialog(this,
-                    "Configuration errors:\n" + errors.toString(),
+                    "DrivePhanQuyen.Configuration errors:\n" + errors.toString(),
                     "Validation Error", JOptionPane.ERROR_MESSAGE);
             return false;
         }
@@ -952,9 +954,9 @@ public class DriveMigrationToolComplete extends JFrame {
 
     private void validateConfig() {
         if (validateConfiguration()) {
-            JOptionPane.showMessageDialog(this, "Configuration is valid!",
+            JOptionPane.showMessageDialog(this, "DrivePhanQuyen.Configuration is valid!",
                     "Validation Success", JOptionPane.INFORMATION_MESSAGE);
-            appendLog("✓ Configuration validation successful");
+            appendLog("✓ DrivePhanQuyen.Configuration validation successful");
         }
     }
 
@@ -1036,8 +1038,8 @@ public class DriveMigrationToolComplete extends JFrame {
         props.setProperty("spreadsheetId", spreadsheetIdField.getText());
 
         try (FileOutputStream out = new FileOutputStream("drive-migration-config.properties")) {
-            props.store(out, "Drive Migration Tool Configuration");
-            appendLog("✓ Configuration saved");
+            props.store(out, "Drive Migration Tool DrivePhanQuyen.Configuration");
+            appendLog("✓ DrivePhanQuyen.Configuration saved");
         } catch (IOException e) {
             appendLog("✗ Error saving configuration: " + e.getMessage());
         }
@@ -1050,7 +1052,7 @@ public class DriveMigrationToolComplete extends JFrame {
             serviceAccountJsonPath = props.getProperty("serviceAccountJsonPath", "");
             serviceAccountEmailField.setText(props.getProperty("serviceAccountEmail", ""));
             spreadsheetIdField.setText(props.getProperty("spreadsheetId", ""));
-            appendLog("✓ Configuration loaded");
+            appendLog("✓ DrivePhanQuyen.Configuration loaded");
         } catch (IOException e) {
             appendLog("ℹ No previous configuration found");
         }

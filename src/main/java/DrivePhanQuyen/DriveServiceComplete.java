@@ -1,3 +1,5 @@
+package DrivePhanQuyen;
+
 import java.io.*;
 import java.net.HttpURLConnection;
 import java.net.URL;
@@ -745,7 +747,7 @@ interface FileProgressCallback {
 /**
  * Class đại diện cho một file trong Drive
  */
-class DriveFile {
+class  DriveFile {
     public String id;
     public String name;
     public String mimeType;
