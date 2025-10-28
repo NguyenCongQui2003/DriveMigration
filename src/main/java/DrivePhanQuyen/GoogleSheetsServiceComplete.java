@@ -65,6 +65,12 @@ public class GoogleSheetsServiceComplete {
     /**
      * Tạo detail sheet ngay khi bắt đầu xử lý user
      */
+    // Thêm map để lưu Sheet ID
+    private final Map<String, Integer> sheetIdCache = new ConcurrentHashMap<>();
+
+    /**
+     * Tạo detail sheet ngay khi bắt đầu xử lý user
+     */
     public void createUserDetailSheetEarly(String userEmail) throws Exception {
         String sheetName = "Detail_" + userEmail.replace("@", "_at_").replace(".", "_");
         sheetNameCache.put(userEmail, sheetName);
@@ -84,13 +90,28 @@ public class GoogleSheetsServiceComplete {
             );
 
             try {
-                makeApiRequest(createEndpoint, "POST", createPayload);
+                String response = makeApiRequest(createEndpoint, "POST", createPayload);
                 System.out.println("DEBUG: Successfully created sheet: " + sheetName);
+
+                // PARSE VÀ LƯU SHEET ID
+                Integer sheetId = extractSheetIdFromResponse(response);
+                if (sheetId != null) {
+                    sheetIdCache.put(userEmail, sheetId);
+                    System.out.println("DEBUG: Cached sheet ID: " + sheetId + " for " + userEmail);
+                }
+
             } catch (Exception e) {
                 if (!e.getMessage().contains("already exists")) {
                     throw e;
                 }
                 System.out.println("DEBUG: Sheet already exists: " + sheetName);
+
+                // NẾU SHEET ĐÃ TỒN TẠI, LẤY SHEET ID
+                Integer existingSheetId = getExistingSheetId(sheetName);
+                if (existingSheetId != null) {
+                    sheetIdCache.put(userEmail, existingSheetId);
+                    System.out.println("DEBUG: Found existing sheet ID: " + existingSheetId);
+                }
             }
 
             // Thêm headers ngay lập tức
@@ -559,13 +580,21 @@ public class GoogleSheetsServiceComplete {
     /**
      * Cập nhật trạng thái user
      */
+    /**
+     * Cập nhật trạng thái user
+     */
     public void updateUserStatus(String userEmail, int rowIndex, String status, MigrationStats stats) throws Exception {
+        System.out.println("DEBUG updateUserStatus: email=" + userEmail + ", row=" + rowIndex + ", status=" + status);
+
         List<String> updates = new ArrayList<>();
 
         if ("In Progress".equals(status)) {
             updates.add(new Date().toString()); // Start date
             updates.add(""); // End date (empty)
             updates.add(status); // Status
+
+            System.out.println("DEBUG: Setting In Progress with " + updates.size() + " columns");
+
         } else if ("Completed".equals(status) || "Failed".equals(status)) {
             // Get current start date
             String currentStartDate = "";
@@ -581,7 +610,7 @@ public class GoogleSheetsServiceComplete {
                     currentStartDate = values.get(0).get(0);
                 }
             } catch (Exception e) {
-                // Ignore error, use current date
+                System.out.println("DEBUG: Could not get start date: " + e.getMessage());
             }
 
             if (currentStartDate.isEmpty()) {
@@ -599,22 +628,53 @@ public class GoogleSheetsServiceComplete {
                 updates.add(String.valueOf(stats.restrictedFiles));
                 updates.add(createDetailSheetLink(userEmail));
             }
+
+            System.out.println("DEBUG: Setting " + status + " with " + updates.size() + " columns");
+
+        } else if ("Not Started".equals(status)) {
+            // THÊM CASE NÀY ĐỂ XỬ LÝ RESET
+            updates.add(""); // Start date - empty
+            updates.add(""); // End date - empty
+            updates.add(status); // Status
+            updates.add("0"); // Total files
+            updates.add("0"); // Success
+            updates.add("0"); // Failed
+            updates.add("0"); // Restricted
+            updates.add(""); // Detail link - empty
+
+            System.out.println("DEBUG: Resetting to Not Started with " + updates.size() + " columns");
         }
 
         if (!updates.isEmpty()) {
-            String range = String.format("Sheet1!B%d:%s%d", rowIndex,
-                    (char)('A' + updates.size()), rowIndex);
+            // Calculate range based on number of updates
+            char endColumn = (char)('A' + updates.size());
+            String range = String.format("Sheet1!B%d:%c%d", rowIndex, endColumn, rowIndex);
 
             String endpoint = String.format(
                     "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s?valueInputOption=RAW",
                     spreadsheetId, range
             );
 
-            String payload = "{\"values\":[" +
-                    "[\"" + String.join("\",\"", updates) + "\"]" +
-                    "]}";
+            // Build JSON payload
+            StringBuilder jsonBuilder = new StringBuilder();
+            jsonBuilder.append("{\"values\":[[");
+            for (int i = 0; i < updates.size(); i++) {
+                if (i > 0) jsonBuilder.append(",");
+                jsonBuilder.append("\"").append(updates.get(i).replace("\"", "\\\"")).append("\"");
+            }
+            jsonBuilder.append("]]}");
 
-            makeApiRequest(endpoint, "PUT", payload);
+            String payload = jsonBuilder.toString();
+
+            System.out.println("DEBUG: Updating range: " + range);
+            System.out.println("DEBUG: Payload: " + payload);
+
+            String response = makeApiRequest(endpoint, "PUT", payload);
+
+            System.out.println("DEBUG: Update response: " + response);
+            System.out.println("✓ Updated user " + userEmail + " to status: " + status);
+        } else {
+            System.out.println("DEBUG: No updates to perform for status: " + status);
         }
     }
 
@@ -708,10 +768,88 @@ public class GoogleSheetsServiceComplete {
     /**
      * Tạo link đến detail sheet
      */
-    private String createDetailSheetLink(String userEmail) {
-        String sheetName = "Detail_" + userEmail.replace("@", "_at_").replace(".", "_");
-        return String.format("https://docs.google.com/spreadsheets/d/%s/edit#gid=0&search=%s",
-                spreadsheetId, sheetName);
+    /**
+     * Tạo link đến detail sheet với Sheet ID chính xác
+     */
+    public String createDetailSheetLink(String userEmail) {
+        Integer sheetId = sheetIdCache.get(userEmail);
+
+        if (sheetId != null) {
+            // Link với Sheet ID chính xác
+            return String.format("https://docs.google.com/spreadsheets/d/%s/edit#gid=%d",
+                    spreadsheetId, sheetId);
+        } else {
+            // Fallback: tìm sheet ID realtime (chậm hơn)
+            String sheetName = "Detail_" + userEmail.replace("@", "_at_").replace(".", "_");
+            Integer foundSheetId = getExistingSheetId(sheetName);
+
+            if (foundSheetId != null) {
+                sheetIdCache.put(userEmail, foundSheetId); // Cache lại
+                return String.format("https://docs.google.com/spreadsheets/d/%s/edit#gid=%d",
+                        spreadsheetId, foundSheetId);
+            }
+
+            // Last resort: dùng search (không đáng tin cậy)
+            System.err.println("WARNING: Could not find sheet ID for " + userEmail + ", using search fallback");
+            return String.format("https://docs.google.com/spreadsheets/d/%s/edit#search=%s",
+                    spreadsheetId, sheetName);
+        }
+    }
+
+    /**
+     * Extract sheet ID từ response khi tạo sheet mới
+     */
+    private Integer extractSheetIdFromResponse(String jsonResponse) {
+        try {
+            // Response format: {"replies":[{"addSheet":{"properties":{"sheetId":123,"title":"..."}}}]}
+            Pattern pattern = Pattern.compile("\"sheetId\"\\s*:\\s*(\\d+)");
+            Matcher matcher = pattern.matcher(jsonResponse);
+            if (matcher.find()) {
+                return Integer.parseInt(matcher.group(1));
+            }
+        } catch (Exception e) {
+            System.err.println("ERROR: Could not extract sheet ID: " + e.getMessage());
+        }
+        return null;
+    }
+
+    /**
+     * Lấy Sheet ID của sheet đã tồn tại
+     */
+    private Integer getExistingSheetId(String sheetName) {
+        try {
+            String endpoint = String.format(
+                    "https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets(properties(sheetId,title))",
+                    spreadsheetId
+            );
+
+            String response = makeApiRequest(endpoint, "GET", null);
+
+            // Parse response để tìm sheetId tương ứng với sheetName
+            String searchPattern = "\"title\"\\s*:\\s*\"" + Pattern.quote(sheetName) + "\"";
+            Pattern titlePattern = Pattern.compile(searchPattern);
+            Matcher titleMatcher = titlePattern.matcher(response);
+
+            if (titleMatcher.find()) {
+                int titlePos = titleMatcher.start();
+
+                // Tìm sheetId gần nhất trước title này
+                String beforeTitle = response.substring(0, titlePos);
+                Pattern idPattern = Pattern.compile("\"sheetId\"\\s*:\\s*(\\d+)");
+                Matcher idMatcher = idPattern.matcher(beforeTitle);
+
+                Integer lastSheetId = null;
+                while (idMatcher.find()) {
+                    lastSheetId = Integer.parseInt(idMatcher.group(1));
+                }
+
+                return lastSheetId;
+            }
+
+        } catch (Exception e) {
+            System.err.println("ERROR: Could not get existing sheet ID: " + e.getMessage());
+        }
+        return null;
     }
 
     /**

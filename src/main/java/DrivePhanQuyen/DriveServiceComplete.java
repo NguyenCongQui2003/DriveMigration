@@ -183,7 +183,7 @@ public class DriveServiceComplete {
         do {
             // CẢI TIẾN: Thêm q parameter để loại trừ trash và chỉ lấy files có shared
             String endpoint = "https://www.googleapis.com/drive/v3/files" +
-                    "?pageSize=100" + // Giảm page size để tránh timeout
+                    "?pageSize=1000" + // Giảm page size để tránh timeout
                     "&q=trashed=false" + // Loại trừ files trong trash
                     "&fields=nextPageToken,files(id,name,mimeType,owners,permissions(role,emailAddress,type),capabilities)" +
                     (pageToken != null ? "&pageToken=" + pageToken : "");
@@ -208,7 +208,8 @@ public class DriveServiceComplete {
             System.out.println("DEBUG: Next page token: " + (pageToken != null ? "exists" : "null"));
 
             // Rate limiting
-            Thread.sleep(200);
+            // Rate limiting - reduced for faster processing
+            Thread.sleep(50); // Giảm từ 200ms xuống 50ms
 
         } while (pageToken != null && totalRetrieved < 10000); // Safety limit
 
@@ -273,8 +274,9 @@ public class DriveServiceComplete {
                 }
 
                 // Rate limiting
-                if (i % 5 == 0 && i > 0) {
-                    Thread.sleep(1000);
+                // Rate limiting - check every 10 files instead of 5
+                if (i % 10 == 0 && i > 0) {
+                    Thread.sleep(500); // Giảm từ 1000ms xuống 500ms
                 }
             }
 
@@ -368,15 +370,14 @@ public class DriveServiceComplete {
                     try {
                         // Create new permission
                         String permissionPayload = String.format(
-                                "{\"type\":\"user\",\"role\":\"%s\",\"emailAddress\":\"%s\",\"sendNotificationEmails\":false,\"suppressNotifications\":true,\"sendNotificationEmail\":false}",
+                                "{\"type\":\"user\",\"role\":\"%s\",\"emailAddress\":\"%s\"}",
                                 permission.role, newEmail
                         );
 
                         String endpoint = String.format(
-                                "https://www.googleapis.com/drive/v3/files/%s/permissions",
+                                "https://www.googleapis.com/drive/v3/files/%s/permissions?sendNotificationEmail=false&supportsAllDrives=true",
                                 file.id
                         );
-
                         System.out.println("DEBUG: Adding permission for " + newEmail + " with role " + permission.role);
 
                         String response = makeApiRequest(endpoint, "POST", permissionPayload, userEmail);

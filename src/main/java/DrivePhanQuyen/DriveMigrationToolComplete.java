@@ -146,6 +146,71 @@ public class DriveMigrationToolComplete extends JFrame {
         return panel;
     }
 
+    private void resetFailedUsers() {
+        int confirm = JOptionPane.showConfirmDialog(
+                this,
+                "Reset all 'Failed' and 'In Progress' users to 'Not Started'?\nThis will update both UI and Google Sheets.",
+                "Reset Users",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+        );
+
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+
+        appendLog("🔄 Resetting failed/in-progress users...");
+
+        // Disable button during reset
+        SwingUtilities.invokeLater(() -> {
+            startButton.setEnabled(false);
+            statusLabel.setText("Resetting users...");
+        });
+
+        // Run in background thread
+        new Thread(() -> {
+            int resetCount = 0;
+            int errorCount = 0;
+
+            for (int i = 0; i < userTableModel.getRowCount(); i++) {
+                UserRecord user = userTableModel.getUser(i);
+                if (user != null && ("Failed".equals(user.status) || "In Progress".equals(user.status))) {
+                    try {
+                        // Update UI first
+                        SwingUtilities.invokeLater(() -> updateUserStatus(user.email, "Not Started"));
+
+                        // Update Google Sheets
+                        sheetsService.updateUserStatus(user.email, user.rowIndex, "Not Started", null);
+
+                        appendLog("✓ Reset user: " + user.email);
+                        resetCount++;
+
+                        // Rate limiting
+                        Thread.sleep(200);
+
+                    } catch (Exception e) {
+                        appendLog("✗ Failed to reset user " + user.email + ": " + e.getMessage());
+                        errorCount++;
+                    }
+                }
+            }
+
+            final int finalResetCount = resetCount;
+            final int finalErrorCount = errorCount;
+
+            SwingUtilities.invokeLater(() -> {
+                appendLog(String.format("✓ Reset completed: %d users reset, %d errors",
+                        finalResetCount, finalErrorCount));
+                startButton.setEnabled(true);
+                statusLabel.setText("Ready");
+
+                // Reload users to confirm
+                loadUsers();
+            });
+
+        }).start();
+    }
+
     private JPanel createUserTablePanel() {
         JPanel panel = new JPanel(new BorderLayout());
         panel.setBorder(new TitledBorder("Users Migration Status"));
@@ -179,6 +244,15 @@ public class DriveMigrationToolComplete extends JFrame {
         JButton loadUsersButton = new JButton("Load Users");
         JButton refreshButton = new JButton("Refresh");
         JButton exportButton = new JButton("Export Results");
+
+        // THÊM NÚT NÀY:
+        JButton resetButton = new JButton("Reset Failed/In Progress");
+        resetButton.addActionListener(e -> resetFailedUsers());
+
+        toolbar.add(loadUsersButton);
+        toolbar.add(refreshButton);
+        toolbar.add(exportButton);
+        toolbar.add(resetButton); // THÊM VÀO TOOLBAR
 
         loadUsersButton.addActionListener(e -> loadUsers());
         refreshButton.addActionListener(e -> refreshUserTable());
@@ -661,17 +735,51 @@ public class DriveMigrationToolComplete extends JFrame {
     }
 
     private void stopMigration() {
+        int confirm = JOptionPane.showConfirmDialog(
+                this,
+                "Stop migration? In-progress users will be reset to 'Not Started'.",
+                "Confirm Stop",
+                JOptionPane.YES_NO_OPTION,
+                JOptionPane.WARNING_MESSAGE
+        );
+
+        if (confirm != JOptionPane.YES_OPTION) {
+            return;
+        }
+
         migrationStopped = true;
+        appendLog("⏹ Stopping migration...");
+
         if (executor != null) {
             executor.shutdownNow();
+            try {
+                executor.awaitTermination(5, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                // Ignore
+            }
             executor = null;
         }
+
+        // Reset "In Progress" users back to "Not Started"
+        SwingUtilities.invokeLater(() -> {
+            for (int i = 0; i < userTableModel.getRowCount(); i++) {
+                UserRecord user = userTableModel.getUser(i);
+                if (user != null && "In Progress".equals(user.status)) {
+                    updateUserStatus(user.email, "Not Started");
+                    try {
+                        sheetsService.updateUserStatus(user.email, user.rowIndex, "Not Started", null);
+                    } catch (Exception e) {
+                        appendLog("⚠ Failed to reset user " + user.email + ": " + e.getMessage());
+                    }
+                }
+            }
+        });
 
         startButton.setEnabled(true);
         pauseButton.setEnabled(false);
         stopButton.setEnabled(false);
-        statusLabel.setText("Migration stopped");
-        appendLog("⏹ Migration stopped by user");
+        statusLabel.setText("Migration stopped - Users reset");
+        appendLog("✓ Migration stopped. In-progress users reset to 'Not Started'");
     }
 
     // Helper methods
