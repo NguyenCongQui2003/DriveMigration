@@ -13,6 +13,7 @@ import java.util.List;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
 import javax.swing.filechooser.*;
+import java.util.concurrent.ThreadFactory;
 
 public class DriveMigrationToolComplete extends JFrame {
     // Services và configuration
@@ -53,6 +54,13 @@ public class DriveMigrationToolComplete extends JFrame {
     private final AtomicInteger totalRestrictedFiles = new AtomicInteger(0);
 
     public DriveMigrationToolComplete() {
+        // Thêm shutdown hook
+        Runtime.getRuntime().addShutdownHook(new Thread(() -> {
+            System.out.println("SHUTDOWN HOOK: Cleaning up...");
+            if (executor != null && !executor.isShutdown()) {
+                executor.shutdownNow();
+            }
+        }));
         initializeUI();
         setupEventHandlers();
         loadConfiguration();
@@ -60,7 +68,7 @@ public class DriveMigrationToolComplete extends JFrame {
 
     private void initializeUI() {
         setTitle("Drive Permission Migration Tool - Enhanced Version");
-        setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
         setSize(1400, 900);
         setLocationRelativeTo(null);
 
@@ -433,6 +441,18 @@ public class DriveMigrationToolComplete extends JFrame {
         JMenu fileMenu = new JMenu("File");
         fileMenu.add(new JMenuItem("Settings")).addActionListener(e -> showSettings());
         fileMenu.addSeparator();
+        fileMenu.add(new JMenuItem("⚠️ Force Exit")).addActionListener(e -> {
+            int confirm = JOptionPane.showConfirmDialog(
+                    this,
+                    "Force exit will terminate all threads immediately!\nUnsaved data may be lost.\n\nContinue?",
+                    "Force Exit",
+                    JOptionPane.YES_NO_OPTION,
+                    JOptionPane.ERROR_MESSAGE
+            );
+            if (confirm == JOptionPane.YES_OPTION) {
+                forceShutdown();
+            }
+        });
         fileMenu.add(new JMenuItem("Exit")).addActionListener(e -> System.exit(0));
 
         // Tools menu
@@ -452,6 +472,52 @@ public class DriveMigrationToolComplete extends JFrame {
         return menuBar;
     }
 
+    /**
+     * Force shutdown tất cả threads và thoát app
+     */
+    private void forceShutdown() {
+        System.out.println("FORCE SHUTDOWN: Starting...");
+
+        // Set stop flag
+        migrationStopped = true;
+
+        // Try to flush pending updates with timeout
+        if (sheetsService != null) {
+            try {
+                System.out.println("FORCE SHUTDOWN: Flushing pending updates...");
+                // Chạy trong thread riêng với timeout
+                Thread flushThread = new Thread(() -> {
+                    try {
+                        sheetsService.flushAllPendingUpdates();
+                    } catch (Exception e) {
+                        System.err.println("FORCE SHUTDOWN: Flush failed: " + e.getMessage());
+                    }
+                });
+                flushThread.setDaemon(true); // Daemon thread sẽ tự tắt khi app exit
+                flushThread.start();
+                flushThread.join(3000); // Đợi tối đa 3 giây
+            } catch (Exception e) {
+                System.err.println("FORCE SHUTDOWN: Flush error: " + e.getMessage());
+            }
+        }
+
+        // Force shutdown executor
+        if (executor != null) {
+            System.out.println("FORCE SHUTDOWN: Shutting down executor...");
+            try {
+                executor.shutdownNow();
+                executor.awaitTermination(2, TimeUnit.SECONDS);
+            } catch (Exception e) {
+                System.err.println("FORCE SHUTDOWN: Executor shutdown error: " + e.getMessage());
+            }
+        }
+
+        System.out.println("FORCE SHUTDOWN: Exiting...");
+
+        // Force exit
+        System.exit(0);
+    }
+
     private void setupEventHandlers() {
         startButton.addActionListener(e -> startMigration());
         pauseButton.addActionListener(e -> pauseMigration());
@@ -463,19 +529,25 @@ public class DriveMigrationToolComplete extends JFrame {
                 if (executor != null && !executor.isShutdown()) {
                     int choice = JOptionPane.showConfirmDialog(
                             DriveMigrationToolComplete.this,
-                            "Migration is in progress. Exit anyway?",
+                            "Migration is in progress. Force exit?",
                             "Confirm Exit",
-                            JOptionPane.YES_NO_OPTION
+                            JOptionPane.YES_NO_OPTION,
+                            JOptionPane.WARNING_MESSAGE
                     );
                     if (choice == JOptionPane.YES_OPTION) {
-                        if (executor != null) executor.shutdownNow();
-                        System.exit(0);
+                        forceShutdown();
+                    } else {
+                        // User clicked No - do nothing, keep window open
+                        return;
                     }
                 } else {
-                    System.exit(0);
+                    forceShutdown();
                 }
             }
         });
+
+// Override default close operation
+        setDefaultCloseOperation(JFrame.DO_NOTHING_ON_CLOSE);
     }
 
     // Core functionality methods
@@ -584,8 +656,18 @@ public class DriveMigrationToolComplete extends JFrame {
             }
 
             // Setup execution
+            // Setup execution với daemon threads
             int threadCount = (Integer) threadCountSpinner.getValue();
-            executor = Executors.newFixedThreadPool(threadCount);
+            executor = Executors.newFixedThreadPool(threadCount, new ThreadFactory() {
+                private final AtomicInteger threadNumber = new AtomicInteger(1);
+
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread thread = new Thread(r, "Migration-Worker-" + threadNumber.getAndIncrement());
+                    thread.setDaemon(true); // QUAN TRỌNG: Set daemon = true
+                    return thread;
+                }
+            });
             migrationPaused = false;
             migrationStopped = false;
 

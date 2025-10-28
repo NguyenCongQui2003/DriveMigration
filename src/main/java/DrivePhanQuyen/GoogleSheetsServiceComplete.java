@@ -12,6 +12,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.time.Instant;
 import java.util.concurrent.*;
+import java.text.SimpleDateFormat;
+import java.util.TimeZone;
 
 /**
  * Service class để tương tác với Google Sheets API sử dụng Service Account
@@ -163,6 +165,9 @@ public class GoogleSheetsServiceComplete {
     /**
      * Flush tất cả pending updates cho một user
      */
+    /**
+     * Flush tất cả pending updates cho một user - SỬ DỤNG APPEND
+     */
     private void flushUserUpdates(String userEmail) throws Exception {
         Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
         if (queue == null || queue.isEmpty()) {
@@ -187,21 +192,11 @@ public class GoogleSheetsServiceComplete {
         }
 
         try {
-            // Tìm next empty row
-            String checkEndpoint = String.format(
-                    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A:A",
-                    spreadsheetId, sheetName
-            );
-
-            String response = makeApiRequest(checkEndpoint, "GET", null);
-            List<List<String>> values = parseValuesFromResponse(response);
-            int nextRow = (values != null ? values.size() : 0) + 1;
-
             // Prepare batch data
             List<List<String>> data = new ArrayList<>();
             for (FileProcessingResult result : batch) {
                 List<String> row = Arrays.asList(
-                        new Date().toString(),
+                        getCurrentVietnameseDateTime(), // THAY ĐỔI
                         result.fileName != null ? result.fileName : "",
                         result.fileId != null ? result.fileId : "",
                         result.fileType != null ? result.fileType : "",
@@ -215,10 +210,10 @@ public class GoogleSheetsServiceComplete {
                 data.add(row);
             }
 
-            // Batch update
-            String updateEndpoint = String.format(
-                    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A%d:J%d?valueInputOption=RAW",
-                    spreadsheetId, sheetName, nextRow, nextRow + data.size() - 1
+            // APPEND - Google tự động mở rộng sheet
+            String appendEndpoint = String.format(
+                    "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A:J:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
+                    spreadsheetId, sheetName
             );
 
             StringBuilder dataJson = new StringBuilder();
@@ -229,8 +224,8 @@ public class GoogleSheetsServiceComplete {
             }
             dataJson.append("]}");
 
-            makeApiRequest(updateEndpoint, "PUT", dataJson.toString());
-            System.out.println("DEBUG: Successfully flushed " + batch.size() + " results to " + sheetName);
+            makeApiRequest(appendEndpoint, "POST", dataJson.toString());
+            System.out.println("DEBUG: Successfully appended " + batch.size() + " results to " + sheetName);
 
         } catch (Exception e) {
             System.err.println("ERROR: Failed to flush updates for " + userEmail + ": " + e.getMessage());
@@ -239,6 +234,29 @@ public class GoogleSheetsServiceComplete {
                 queue.offer(result);
             }
         }
+    }
+
+    /**
+     * Format ngày giờ sang tiếng Việt
+     */
+    private String formatVietnameseDateTime(Date date) {
+        java.text.SimpleDateFormat sdf = new java.text.SimpleDateFormat("dd/MM/yyyy HH:mm:ss");
+        sdf.setTimeZone(java.util.TimeZone.getTimeZone("Asia/Ho_Chi_Minh"));
+
+        String formatted = sdf.format(date);
+
+        // Thêm chữ "Ngày" ở đầu nếu muốn
+        return formatted;
+
+        // HOẶC format đầy đủ hơn:
+        // return "Ngày " + formatted;
+    }
+
+    /**
+     * Lấy ngày giờ hiện tại theo định dạng Việt Nam
+     */
+    private String getCurrentVietnameseDateTime() {
+        return formatVietnameseDateTime(new Date());
     }
 
     /**
@@ -589,9 +607,14 @@ public class GoogleSheetsServiceComplete {
         List<String> updates = new ArrayList<>();
 
         if ("In Progress".equals(status)) {
-            updates.add(new Date().toString()); // Start date
+            updates.add(getCurrentVietnameseDateTime()); // Start date - THAY ĐỔI
             updates.add(""); // End date (empty)
             updates.add(status); // Status
+            updates.add(""); // Total files - will be updated later
+            updates.add(""); // Success
+            updates.add(""); // Failed
+            updates.add(""); // Restricted
+            updates.add(createDetailSheetLink(userEmail)); // Link chi tiết
 
             System.out.println("DEBUG: Setting In Progress with " + updates.size() + " columns");
 
@@ -614,11 +637,11 @@ public class GoogleSheetsServiceComplete {
             }
 
             if (currentStartDate.isEmpty()) {
-                currentStartDate = new Date().toString();
+                currentStartDate = getCurrentVietnameseDateTime(); // THAY ĐỔI
             }
 
             updates.add(currentStartDate); // Keep existing start date
-            updates.add(new Date().toString()); // End date
+            updates.add(getCurrentVietnameseDateTime()); // End date - THAY ĐỔI
             updates.add(status); // Status
 
             if (stats != null) {
@@ -627,12 +650,17 @@ public class GoogleSheetsServiceComplete {
                 updates.add(String.valueOf(stats.failedFiles));
                 updates.add(String.valueOf(stats.restrictedFiles));
                 updates.add(createDetailSheetLink(userEmail));
+            } else {
+                updates.add("0"); // Total files
+                updates.add("0"); // Success
+                updates.add("0"); // Failed
+                updates.add("0"); // Restricted
+                updates.add(createDetailSheetLink(userEmail));
             }
 
             System.out.println("DEBUG: Setting " + status + " with " + updates.size() + " columns");
-
         } else if ("Not Started".equals(status)) {
-            // THÊM CASE NÀY ĐỂ XỬ LÝ RESET
+            // RESET
             updates.add(""); // Start date - empty
             updates.add(""); // End date - empty
             updates.add(status); // Status
@@ -640,7 +668,7 @@ public class GoogleSheetsServiceComplete {
             updates.add("0"); // Success
             updates.add("0"); // Failed
             updates.add("0"); // Restricted
-            updates.add(""); // Detail link - empty
+            updates.add(""); // Detail link - empty khi reset
 
             System.out.println("DEBUG: Resetting to Not Started with " + updates.size() + " columns");
         }
@@ -728,7 +756,7 @@ public class GoogleSheetsServiceComplete {
 
                 for (FileProcessingResult result : results) {
                     List<String> row = Arrays.asList(
-                            new Date().toString(),
+                            getCurrentVietnameseDateTime(), // THAY ĐỔI
                             result.fileName != null ? result.fileName : "",
                             result.fileId != null ? result.fileId : "",
                             result.fileType != null ? result.fileType : "",
@@ -897,7 +925,7 @@ public class GoogleSheetsServiceComplete {
 
             String logPayload = String.format(
                     "{\"values\":[[\"%s\",\"%s\",\"%s\",\"%s\"]]}",
-                    new Date().toString(), level, message, details != null ? details : ""
+                    getCurrentVietnameseDateTime(), level, message, details != null ? details : ""
             );
 
             makeApiRequest(appendEndpoint, "POST", logPayload);
