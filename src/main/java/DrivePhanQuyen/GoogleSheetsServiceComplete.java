@@ -133,6 +133,17 @@ public class GoogleSheetsServiceComplete {
         System.out.println("DEBUG: Creating detail sheet for user: " + userEmail);
 
         try {
+            // Check if exists first
+            Integer existingSheetId = getExistingSheetId(sheetName);
+
+            if (existingSheetId != null) {
+                System.out.println("DEBUG: Sheet already exists with ID: " + existingSheetId);
+                sheetIdCache.put(userEmail, existingSheetId);
+                updateQueues.put(userEmail, new LinkedList<>());
+                return;
+            }
+
+            // Create new sheet
             String createEndpoint = String.format(
                     "https://sheets.googleapis.com/v4/spreadsheets/%s:batchUpdate",
                     spreadsheetId
@@ -143,30 +154,26 @@ public class GoogleSheetsServiceComplete {
                     sheetName
             );
 
-            try {
-                String response = makeApiRequestWithRetry(createEndpoint, "POST", createPayload);
-                System.out.println("DEBUG: Successfully created sheet: " + sheetName);
+            String response = makeApiRequestWithRetry(createEndpoint, "POST", createPayload);
+            System.out.println("DEBUG: Create response: " + response);
 
-                Integer sheetId = extractSheetIdFromResponse(response);
-                if (sheetId != null) {
-                    sheetIdCache.put(userEmail, sheetId);
-                    System.out.println("DEBUG: Cached sheet ID: " + sheetId + " for " + userEmail);
-                }
-
-            } catch (Exception e) {
-                if (!e.getMessage().contains("already exists")) {
-                    throw e;
-                }
-                System.out.println("DEBUG: Sheet already exists: " + sheetName);
-
-                Integer existingSheetId = getExistingSheetId(sheetName);
+            // Extract Sheet ID
+            Integer sheetId = extractSheetIdFromResponse(response);
+            if (sheetId != null) {
+                sheetIdCache.put(userEmail, sheetId);
+                System.out.println("DEBUG: Created sheet with ID: " + sheetId);
+            } else {
+                // Fallback: search again
+                System.out.println("DEBUG: Could not extract ID, searching...");
+                Thread.sleep(2000);
+                existingSheetId = getExistingSheetId(sheetName);
                 if (existingSheetId != null) {
                     sheetIdCache.put(userEmail, existingSheetId);
-                    System.out.println("DEBUG: Found existing sheet ID: " + existingSheetId);
+                    System.out.println("DEBUG: Found ID via search: " + existingSheetId);
                 }
             }
 
-            // Thêm headers
+            // Add headers
             List<String> headers = Arrays.asList(
                     "Timestamp", "File Name", "File ID", "Type", "Permission Type",
                     "Status", "Old Email", "New Email", "Role", "Error Message"
@@ -183,31 +190,48 @@ public class GoogleSheetsServiceComplete {
 
             makeApiRequestWithRetry(headerEndpoint, "PUT", headerPayload);
 
-            // Khởi tạo queue
+            // Init queue
             updateQueues.put(userEmail, new LinkedList<>());
 
-            System.out.println("DEBUG: Detail sheet ready for user: " + userEmail);
+            System.out.println("DEBUG: Detail sheet ready: " + userEmail);
 
         } catch (Exception e) {
             System.err.println("ERROR: Failed to create detail sheet for " + userEmail + ": " + e.getMessage());
+            e.printStackTrace();
             throw e;
         }
     }
+
 
     /**
      * IMPROVED: Queue file results với auto-flush ít thường xuyên hơn
      */
     public void appendFileResultToDetailSheet(String userEmail, FileProcessingResult result) throws Exception {
-        synchronized (batchLock) {
-            Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
-            if (queue != null) {
-                queue.offer(result);
+        Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
+        if (queue == null) {
+            System.err.println("ERROR: No queue found for user: " + userEmail);
+            return;
+        }
 
-                // THAY ĐỔI: Chỉ flush khi queue đủ LỚN (200 thay vì 10)
-                if (queue.size() >= AUTO_FLUSH_THRESHOLD) {
-                    System.out.println("AUTO-FLUSH: Queue size reached " + AUTO_FLUSH_THRESHOLD);
-                    flushUserUpdates(userEmail);
-                }
+        // SANITIZE result before queueing
+        FileProcessingResult safeResult = new FileProcessingResult();
+        safeResult.fileName = result.fileName;
+        safeResult.fileId = result.fileId;
+        safeResult.fileType = result.fileType;
+        safeResult.permissionType = result.permissionType;
+        safeResult.status = result.status;
+        safeResult.oldEmail = result.oldEmail;
+        safeResult.newEmail = result.newEmail;
+        safeResult.role = result.role;
+        safeResult.errorMessage = sanitizeErrorMessage(result.errorMessage);
+        safeResult.permissionsAdded = result.permissionsAdded;
+
+        synchronized (batchLock) {
+            queue.offer(safeResult);
+
+            if (queue.size() >= AUTO_FLUSH_THRESHOLD) {
+                System.out.println("AUTO-FLUSH: Queue size " + queue.size() + " for " + userEmail);
+                flushUserUpdates(userEmail);
             }
         }
     }
@@ -229,28 +253,48 @@ public class GoogleSheetsServiceComplete {
 
         List<FileProcessingResult> batch = new ArrayList<>();
 
-        // THAY ĐỔI: Lấy 100 files mỗi lần thay vì 20
-        while (!queue.isEmpty() && batch.size() < FLUSH_BATCH_SIZE) {
-            batch.add(queue.poll());
+        synchronized (batchLock) {
+            while (!queue.isEmpty() && batch.size() < FLUSH_BATCH_SIZE) {
+                batch.add(queue.poll());
+            }
         }
 
         if (batch.isEmpty()) {
             return;
         }
 
-        System.out.println("FLUSH: Flushing " + batch.size() + " file results for " + userEmail);
+        System.out.println("FLUSH: Writing " + batch.size() + " results for " + userEmail);
 
         String sheetName = sheetNameCache.get(userEmail);
         if (sheetName == null) {
-            System.err.println("ERROR: No sheet name found for user: " + userEmail);
+            System.err.println("ERROR: No sheet name for user: " + userEmail);
+
+            // Re-queue
+            synchronized (batchLock) {
+                for (FileProcessingResult result : batch) {
+                    queue.offer(result);
+                }
+            }
             return;
         }
 
         try {
-            // Prepare batch data
-            List<List<String>> data = new ArrayList<>();
-            for (FileProcessingResult result : batch) {
-                List<String> row = Arrays.asList(
+            // BUILD JSON PROPERLY - Character by character with escaping
+            StringBuilder jsonPayload = new StringBuilder();
+            jsonPayload.append("{\"values\":[");
+
+            for (int i = 0; i < batch.size(); i++) {
+                FileProcessingResult result = batch.get(i);
+
+                if (i > 0) {
+                    jsonPayload.append(",");
+                }
+
+                // Start row array
+                jsonPayload.append("[");
+
+                // Build array of cell values
+                String[] cells = new String[] {
                         getCurrentVietnameseDateTime(),
                         result.fileName != null ? result.fileName : "",
                         result.fileId != null ? result.fileId : "",
@@ -261,39 +305,64 @@ public class GoogleSheetsServiceComplete {
                         result.newEmail != null ? result.newEmail : "",
                         result.role != null ? result.role : "",
                         result.errorMessage != null ? result.errorMessage : ""
-                );
-                data.add(row);
+                };
+
+                // Add each cell with proper escaping
+                for (int j = 0; j < cells.length; j++) {
+                    if (j > 0) {
+                        jsonPayload.append(",");
+                    }
+                    jsonPayload.append("\"");
+                    jsonPayload.append(escapeForJson(cells[j]));
+                    jsonPayload.append("\"");
+                }
+
+                // End row array
+                jsonPayload.append("]");
             }
 
-            // APPEND với retry
+            jsonPayload.append("]}");
+
+            // Debug first few batches
+            if (batch.size() <= 3) {
+                System.out.println("DEBUG PAYLOAD: " + jsonPayload.toString());
+            }
+
+            // APPEND to sheet
             String appendEndpoint = String.format(
                     "https://sheets.googleapis.com/v4/spreadsheets/%s/values/%s!A:J:append?valueInputOption=RAW&insertDataOption=INSERT_ROWS",
                     spreadsheetId, sheetName
             );
 
-            StringBuilder dataJson = new StringBuilder();
-            dataJson.append("{\"values\":[");
-            for (int i = 0; i < data.size(); i++) {
-                if (i > 0) dataJson.append(",");
-                dataJson.append("[\"").append(String.join("\",\"", data.get(i))).append("\"]");
-            }
-            dataJson.append("]}");
+            makeApiRequestWithRetry(appendEndpoint, "POST", jsonPayload.toString());
 
-            makeApiRequestWithRetry(appendEndpoint, "POST", dataJson.toString());
-            System.out.println("FLUSH SUCCESS: Appended " + batch.size() + " results to " + sheetName);
+            System.out.println("FLUSH SUCCESS: Wrote " + batch.size() + " results to " + sheetName);
 
         } catch (Exception e) {
-            System.err.println("FLUSH ERROR: Failed to flush updates for " + userEmail + ": " + e.getMessage());
+            System.err.println("FLUSH ERROR for " + userEmail + ": " + e.getMessage());
 
-            // THAY ĐỔI: Re-queue với giới hạn để tránh memory leak
-            if (queue.size() < 1000) { // Giới hạn 1000 items trong queue
-                for (FileProcessingResult result : batch) {
-                    queue.offer(result);
-                }
-                System.out.println("Re-queued " + batch.size() + " results for retry");
-            } else {
-                System.err.println("WARNING: Queue too large, dropping " + batch.size() + " results");
+            // Print first item for debugging
+            if (!batch.isEmpty()) {
+                FileProcessingResult first = batch.get(0);
+                System.err.println("First failed item:");
+                System.err.println("  File: " + first.fileName);
+                System.err.println("  Error: " + first.errorMessage);
             }
+
+            // Re-queue with limit
+            synchronized (batchLock) {
+                if (queue.size() < 5000) {
+                    for (FileProcessingResult result : batch) {
+                        queue.offer(result);
+                    }
+                    System.out.println("Re-queued " + batch.size() + " results for retry");
+                } else {
+                    System.err.println("WARNING: Queue too large, dropping " + batch.size() + " results");
+                }
+            }
+
+            // Re-throw để retry mechanism hoạt động
+            throw e;
         }
     }
 
@@ -328,37 +397,45 @@ public class GoogleSheetsServiceComplete {
         synchronized (batchLock) {
             System.out.println("=== FINAL FLUSH: Starting ===");
 
-            int totalUsers = updateQueues.size();
-            int processedUsers = 0;
+            List<String> usersWithPending = new ArrayList<>();
 
             for (String userEmail : updateQueues.keySet()) {
                 Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
-                int queueSize = queue != null ? queue.size() : 0;
-
-                if (queueSize > 0) {
-                    System.out.println("FINAL FLUSH: User " + userEmail + " has " + queueSize + " pending updates");
-
-                    try {
-                        // Flush nhiều lần nếu cần
-                        while (queue != null && !queue.isEmpty()) {
-                            flushUserUpdates(userEmail);
-
-                            // Đợi thêm giữa các batch để tránh rate limit
-                            if (!queue.isEmpty()) {
-                                Thread.sleep(2000);
-                            }
-                        }
-                        System.out.println("FINAL FLUSH: Completed for " + userEmail);
-                    } catch (Exception e) {
-                        System.err.println("FINAL FLUSH ERROR: Failed for " + userEmail + ": " + e.getMessage());
-                    }
+                if (queue != null && !queue.isEmpty()) {
+                    usersWithPending.add(userEmail);
                 }
-
-                processedUsers++;
-                System.out.println("FINAL FLUSH: Progress " + processedUsers + "/" + totalUsers);
             }
 
-            System.out.println("=== FINAL FLUSH: Completed ===");
+            if (usersWithPending.isEmpty()) {
+                System.out.println("FINAL FLUSH: No pending updates");
+                return;
+            }
+
+            System.out.println("FINAL FLUSH: " + usersWithPending.size() + " users have pending updates");
+
+            for (int i = 0; i < usersWithPending.size(); i++) {
+                String userEmail = usersWithPending.get(i);
+                Queue<FileProcessingResult> queue = updateQueues.get(userEmail);
+
+                System.out.println("FINAL FLUSH: [" + (i+1) + "/" + usersWithPending.size() + "] " +
+                        userEmail + " - " + queue.size() + " items");
+
+                try {
+                    while (queue != null && !queue.isEmpty()) {
+                        flushUserUpdates(userEmail);
+
+                        if (!queue.isEmpty()) {
+                            Thread.sleep(300);
+                        }
+                    }
+                    System.out.println("FINAL FLUSH: ✓ Completed " + userEmail);
+
+                } catch (Exception e) {
+                    System.err.println("FINAL FLUSH ERROR for " + userEmail + ": " + e.getMessage());
+                }
+            }
+
+            System.out.println("=== FINAL FLUSH: All Done ===");
         }
     }
 
@@ -914,23 +991,40 @@ public class GoogleSheetsServiceComplete {
      */
     private Integer extractSheetIdFromResponse(String jsonResponse) {
         try {
-            // Response format: {"replies":[{"addSheet":{"properties":{"sheetId":123,"title":"..."}}}]}
+            System.out.println("DEBUG: Extracting sheet ID from: " + jsonResponse);
+
+            // Find "addSheet" section
+            int addSheetIndex = jsonResponse.indexOf("\"addSheet\"");
+            if (addSheetIndex == -1) {
+                System.out.println("DEBUG: No 'addSheet' found");
+                return null;
+            }
+
+            // Find sheetId after addSheet
+            int searchStart = addSheetIndex;
             Pattern pattern = Pattern.compile("\"sheetId\"\\s*:\\s*(\\d+)");
-            Matcher matcher = pattern.matcher(jsonResponse);
+            Matcher matcher = pattern.matcher(jsonResponse.substring(searchStart));
+
             if (matcher.find()) {
-                return Integer.parseInt(matcher.group(1));
+                int sheetId = Integer.parseInt(matcher.group(1));
+                System.out.println("DEBUG: Extracted sheet ID: " + sheetId);
+                return sheetId;
             }
         } catch (Exception e) {
-            System.err.println("ERROR: Could not extract sheet ID: " + e.getMessage());
+            System.err.println("ERROR: Extract sheet ID failed: " + e.getMessage());
+            e.printStackTrace();
         }
         return null;
     }
+
 
     /**
      * Lấy Sheet ID của sheet đã tồn tại
      */
     private Integer getExistingSheetId(String sheetName) {
         try {
+            System.out.println("DEBUG: Looking for existing sheet: " + sheetName);
+
             String endpoint = String.format(
                     "https://sheets.googleapis.com/v4/spreadsheets/%s?fields=sheets(properties(sheetId,title))",
                     spreadsheetId
@@ -938,31 +1032,112 @@ public class GoogleSheetsServiceComplete {
 
             String response = makeApiRequest(endpoint, "GET", null);
 
-            // Parse response để tìm sheetId tương ứng với sheetName
-            String searchPattern = "\"title\"\\s*:\\s*\"" + Pattern.quote(sheetName) + "\"";
-            Pattern titlePattern = Pattern.compile(searchPattern);
-            Matcher titleMatcher = titlePattern.matcher(response);
+            // Find sheet by title
+            int currentPos = 0;
+            while (currentPos < response.length()) {
+                int titleStart = response.indexOf("\"title\"", currentPos);
+                if (titleStart == -1) break;
 
-            if (titleMatcher.find()) {
-                int titlePos = titleMatcher.start();
+                int titleValueStart = response.indexOf("\"", titleStart + 7) + 1;
+                int titleValueEnd = response.indexOf("\"", titleValueStart);
+                String title = response.substring(titleValueStart, titleValueEnd);
 
-                // Tìm sheetId gần nhất trước title này
-                String beforeTitle = response.substring(0, titlePos);
-                Pattern idPattern = Pattern.compile("\"sheetId\"\\s*:\\s*(\\d+)");
-                Matcher idMatcher = idPattern.matcher(beforeTitle);
+                if (title.equals(sheetName)) {
+                    // Find sheetId before this title
+                    String beforeTitle = response.substring(0, titleStart);
+                    Pattern idPattern = Pattern.compile("\"sheetId\"\\s*:\\s*(\\d+)");
+                    Matcher idMatcher = idPattern.matcher(beforeTitle);
 
-                Integer lastSheetId = null;
-                while (idMatcher.find()) {
-                    lastSheetId = Integer.parseInt(idMatcher.group(1));
+                    Integer lastSheetId = null;
+                    while (idMatcher.find()) {
+                        lastSheetId = Integer.parseInt(idMatcher.group(1));
+                    }
+
+                    if (lastSheetId != null) {
+                        System.out.println("DEBUG: Found sheet ID: " + lastSheetId);
+                        return lastSheetId;
+                    }
                 }
 
-                return lastSheetId;
+                currentPos = titleValueEnd + 1;
             }
 
+            System.out.println("DEBUG: Sheet not found: " + sheetName);
+
         } catch (Exception e) {
-            System.err.println("ERROR: Could not get existing sheet ID: " + e.getMessage());
+            System.err.println("ERROR: Get existing sheet ID failed: " + e.getMessage());
+            e.printStackTrace();
         }
         return null;
+    }
+
+    /**
+     * CRITICAL: Escape ALL special characters for JSON
+     */
+    private String escapeForJson(String str) {
+        if (str == null || str.isEmpty()) {
+            return "";
+        }
+
+        StringBuilder escaped = new StringBuilder();
+
+        for (int i = 0; i < str.length(); i++) {
+            char c = str.charAt(i);
+
+            switch (c) {
+                case '"':
+                    escaped.append("\\\"");
+                    break;
+                case '\\':
+                    escaped.append("\\\\");
+                    break;
+                case '\b':
+                    escaped.append("\\b");
+                    break;
+                case '\f':
+                    escaped.append("\\f");
+                    break;
+                case '\n':
+                    escaped.append("\\n");
+                    break;
+                case '\r':
+                    escaped.append("\\r");
+                    break;
+                case '\t':
+                    escaped.append("\\t");
+                    break;
+                default:
+                    // Escape control characters (0x00 - 0x1F)
+                    if (c < 0x20) {
+                        escaped.append(String.format("\\u%04x", (int) c));
+                    } else {
+                        escaped.append(c);
+                    }
+            }
+        }
+
+        return escaped.toString();
+    }
+
+    /**
+     * CRITICAL: Sanitize error messages
+     */
+    private String sanitizeErrorMessage(String errorMessage) {
+        if (errorMessage == null) {
+            return "";
+        }
+
+        // Truncate if too long
+        if (errorMessage.length() > 5000) {
+            errorMessage = errorMessage.substring(0, 4997) + "...";
+        }
+
+        // Remove problematic characters
+        errorMessage = errorMessage
+                .replace('\u0000', ' ') // NULL character
+                .replace('\uFFFD', ' '); // Replacement character
+
+        return errorMessage;
     }
 
     /**
