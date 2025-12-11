@@ -45,8 +45,9 @@ public class DriveServiceComplete {
     private static final int MAX_DELAY_MS = 500;
 
     // ===== ACCESS TOKEN CACHE =====
-    private String cachedAccessToken = null;
-    private long tokenExpiryTime = 0;
+    // ===== ACCESS TOKEN CACHE - MỖI USER MỘT TOKEN =====
+    private final Map<String, String> cachedAccessTokens = new ConcurrentHashMap<>();
+    private final Map<String, Long> tokenExpiryTimes = new ConcurrentHashMap<>();
     private final Object tokenLock = new Object();
 
     public DriveServiceComplete(String serviceAccountEmail, String privateKey) {
@@ -102,14 +103,24 @@ public class DriveServiceComplete {
     /**
      * CACHED ACCESS TOKEN
      */
+    /**
+     * CACHED ACCESS TOKEN - MỖI USER MỘT TOKEN
+     */
     private String getAccessToken(String userEmail) throws Exception {
         synchronized (tokenLock) {
             long now = System.currentTimeMillis();
 
-            if (cachedAccessToken != null && now < (tokenExpiryTime - 300000)) {
-                return cachedAccessToken;
+            // ★ KIỂM TRA CACHE CHO USER CỤ THỂ ★
+            String cachedToken = cachedAccessTokens.get(userEmail);
+            Long expiryTime = tokenExpiryTimes.get(userEmail);
+
+            if (cachedToken != null && expiryTime != null && now < (expiryTime - 300000)) {
+                System.out.println("🔑 [CACHE] Using token for: " + userEmail);
+                return cachedToken;
             }
 
+            // ★ TẠO TOKEN MỚI CHO USER NÀY ★
+            System.out.println("🔑 [NEW] Getting token for: " + userEmail);
             String jwt = createJWT(userEmail);
             URL url = new URL("https://oauth2.googleapis.com/token");
             HttpURLConnection conn = (HttpURLConnection) url.openConnection();
@@ -131,7 +142,7 @@ public class DriveServiceComplete {
                     while ((line = errorReader.readLine()) != null) {
                         errorResponse.append(line);
                     }
-                    throw new RuntimeException("Failed to get access token: " + responseCode + " - " + errorResponse.toString());
+                    throw new RuntimeException("Failed to get access token for " + userEmail + ": " + responseCode + " - " + errorResponse.toString());
                 }
             }
 
@@ -147,15 +158,22 @@ public class DriveServiceComplete {
                 Matcher matcher = pattern.matcher(jsonResponse);
 
                 if (matcher.find()) {
-                    cachedAccessToken = matcher.group(1);
-                    tokenExpiryTime = now + 3600000;
-                    return cachedAccessToken;
+                    String newToken = matcher.group(1);
+                    long newExpiryTime = now + 3600000;
+
+                    // ★ LƯU TOKEN RIÊNG CHO USER NÀY ★
+                    cachedAccessTokens.put(userEmail, newToken);
+                    tokenExpiryTimes.put(userEmail, newExpiryTime);
+
+                    System.out.println("✅ [SAVED] Token cached for: " + userEmail);
+                    return newToken;
                 } else {
                     throw new RuntimeException("Could not extract access token from response: " + jsonResponse);
                 }
             }
         }
     }
+
 
     /**
      * API REQUEST với RETRY LOGIC và DYNAMIC RATE LIMITING
